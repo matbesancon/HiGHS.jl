@@ -362,7 +362,7 @@ function MOI.get(model::Optimizer, ::MOI.NumberOfConstraints{F,S}) where {F,S}
     return length(MOI.get(model, MOI.ListOfConstraintIndices{F,S}()))
 end
 
-function MOI.get(model::Optimizer, ::MOI.ListOfConstraints)
+function MOI.get(model::Optimizer, ::MOI.ListOfConstraintTypesPresent)
     constraints = Set{Tuple{DataType,DataType}}()
     for info in values(model.variable_info)
         if info.bound == _BOUND_NONE
@@ -390,13 +390,10 @@ function MOI.get(model::Optimizer, ::MOI.ListOfConstraints)
 end
 
 ###
-### MOI.RawParameter
+### MOI.RawOptimizerAttribute
 ###
 
-function MOI.supports(model::Optimizer, param::MOI.RawParameter)
-    if !(param.name isa String)
-        return false
-    end
+function MOI.supports(model::Optimizer, param::MOI.RawOptimizerAttribute)
     typeP = Ref{Cint}()
     return Highs_getHighsOptionType(model, param.name, typeP) == 0
 end
@@ -424,7 +421,7 @@ function _set_option(model::Optimizer, option::String, value::String)
     return Highs_setHighsStringOptionValue(model, option, value)
 end
 
-function MOI.set(model::Optimizer, param::MOI.RawParameter, value)
+function MOI.set(model::Optimizer, param::MOI.RawOptimizerAttribute, value)
     if !MOI.supports(model, param)
         throw(MOI.UnsupportedAttribute(param))
     end
@@ -465,7 +462,7 @@ function _get_string_option(model::Optimizer, option::String)
     end
 end
 
-function MOI.get(model::Optimizer, param::MOI.RawParameter)
+function MOI.get(model::Optimizer, param::MOI.RawOptimizerAttribute)
     if !(param.name isa String)
         throw(MOI.UnsupportedAttribute(param))
     end
@@ -492,15 +489,15 @@ end
 MOI.supports(::Optimizer, ::MOI.TimeLimitSec) = true
 
 function MOI.set(model::Optimizer, ::MOI.TimeLimitSec, ::Nothing)
-    return MOI.set(model, MOI.RawParameter("time_limit"), Inf)
+    return MOI.set(model, MOI.RawOptimizerAttribute("time_limit"), Inf)
 end
 
 function MOI.set(model::Optimizer, ::MOI.TimeLimitSec, limit::Real)
-    return MOI.set(model, MOI.RawParameter("time_limit"), Float64(limit))
+    return MOI.set(model, MOI.RawOptimizerAttribute("time_limit"), Float64(limit))
 end
 
 function MOI.get(model::Optimizer, ::MOI.TimeLimitSec)
-    return MOI.get(model, MOI.RawParameter("time_limit"))
+    return MOI.get(model, MOI.RawOptimizerAttribute("time_limit"))
 end
 
 ###
@@ -706,7 +703,7 @@ function MOI.set(
     num_vars = length(model.variable_info)
     obj = zeros(Float64, num_vars)
     for term in f.terms
-        col = column(model, term.variable_index)
+        col = column(model, term.variable)
         obj[col+1] += term.coefficient
     end
     # TODO(odow): cache the mask.
@@ -1178,7 +1175,7 @@ function _indices_and_coefficients(
 )
     i = 1
     for term in f.terms
-        indices[i] = column(model, term.variable_index)
+        indices[i] = column(model, term.variable)
         coefficients[i] = term.coefficient
         i += 1
     end
@@ -1456,9 +1453,9 @@ function MOI.set(
     # complainsm but it will require some upstream changes to introduce a faster
     # way of modifying a list of coefficients.
     old = MOI.get(model, MOI.ConstraintFunction(), c)
-    terms = Dict(x.variable_index => 0.0 for x in old.terms)
+    terms = Dict(x.variable => 0.0 for x in old.terms)
     for term in f.terms
-        terms[term.variable_index] = term.coefficient
+        terms[term.variable] = term.coefficient
     end
     r = row(model, c)
     for (k, v) in terms
@@ -1600,7 +1597,7 @@ function MOI.get(model::Optimizer, ::MOI.RawStatusString)
 end
 
 function MOI.get(model::Optimizer, attr::MOI.PrimalStatus)
-    if attr.N != 1
+    if attr.result_index != 1
         return MOI.NO_SOLUTION
     elseif model.solution.has_solution
         return MOI.FEASIBLE_POINT
@@ -1611,7 +1608,7 @@ function MOI.get(model::Optimizer, attr::MOI.PrimalStatus)
 end
 
 function MOI.get(model::Optimizer, attr::MOI.DualStatus)
-    if attr.N != 1
+    if attr.result_index != 1
         return MOI.NO_SOLUTION
     elseif model.solution.has_solution
         return MOI.FEASIBLE_POINT
@@ -1631,7 +1628,7 @@ function MOI.get(model::Optimizer, attr::MOI.DualObjectiveValue)
     return MOI.Utilities.get_fallback(model, attr, Float64)
 end
 
-function MOI.get(model::Optimizer, ::MOI.SolveTime)
+function MOI.get(model::Optimizer, ::MOI.SolveTimeSec)
     return Highs_getHighsRunTime(model)
 end
 
@@ -1878,11 +1875,11 @@ function _extract_bound_data(
         MOI.get(src, MOI.ListOfConstraintIndices{MOI.SingleVariable,S}())
         f = MOI.get(src, MOI.ConstraintFunction(), c_index)
         s = MOI.get(src, MOI.ConstraintSet(), c_index)
-        new_f = mapping.varmap[f.variable]
+        new_f = mapping[f.variable]
         info = _info(dest, new_f)
         _add_bounds(collower, colupper, info.column + 1, s)
         _update_info(info, s)
-        mapping.conmap[c_index] =
+        mapping[c_index] =
             MOI.ConstraintIndex{MOI.SingleVariable,S}(new_f.value)
     end
     return
@@ -1900,13 +1897,13 @@ function _copy_to_columns(dest::Optimizer, src::MOI.ModelLike, mapping)
         info.name = MOI.get(dest, MOI.VariableName(), x_src[i])
         info.index = index
         info.column = Cint(i - 1)
-        mapping.varmap[x_src[i]] = index
+        mapping[x_src[i]] = index
     end
     fobj =
         MOI.get(src, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}())
     c = fill(0.0, numcols)
     for term in fobj.terms
-        i = mapping.varmap[term.variable_index].value
+        i = mapping[term.variable].value
         c[i] += term.coefficient
     end
     dest.objective_constant = fobj.constant
@@ -1950,7 +1947,7 @@ function _extract_row_data(
         )
         dest.affine_constraint_info[key].row =
             Cint(length(dest.affine_constraint_info) - 1)
-        mapping.conmap[c_index] =
+        mapping[c_index] =
             MOI.ConstraintIndex{MOI.ScalarAffineFunction{Float64},S}(key.value)
     end
     add_sizehint!(I, n_terms)
@@ -1959,7 +1956,7 @@ function _extract_row_data(
     for (i, c_index) in enumerate(list)
         for term in fs[i].terms
             push!(I, row)
-            push!(J, Cint(mapping.varmap[term.variable_index].value))
+            push!(J, Cint(mapping[term.variable].value))
             push!(V, term.coefficient)
         end
         row += 1
@@ -1968,7 +1965,7 @@ function _extract_row_data(
 end
 
 function _check_input_data(dest::Optimizer, src::MOI.ModelLike)
-    for (F, S) in MOI.get(src, MOI.ListOfConstraints())
+    for (F, S) in MOI.get(src, MOI.ListOfConstraintTypesPresent())
         if !MOI.supports_constraint(dest, F, S)
             throw(
                 MOI.UnsupportedConstraint{F,S}(
@@ -1984,7 +1981,7 @@ function _check_input_data(dest::Optimizer, src::MOI.ModelLike)
     return
 end
 
-MOI.Utilities.supports_default_copy_to(::Optimizer, ::Bool) = true
+MOI.supports_incremental_interface(::Optimizer, ::Bool) = true
 
 function MOI.copy_to(
     dest::Optimizer,
