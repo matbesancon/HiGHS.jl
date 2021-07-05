@@ -249,6 +249,9 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
     # and FEASIBILITY_SENSE.
     is_feasibility::Bool
 
+    # A flag to keep track of whether the objective is linear or quadratic.
+    is_qp::Bool
+
     # HiGHS doesn't have special support for binary variables. Cache them here
     # to modify bounds on solve.
     binaries::Set{_VariableInfo}
@@ -288,6 +291,7 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
             ptr,
             "",
             true,
+            false,
             Set{_VariableInfo}(),
             0.0,
             _variable_info_dict(),
@@ -328,6 +332,7 @@ function MOI.empty!(model::Optimizer)
     _check_ret(ret)
     model.objective_constant = 0.0
     model.is_feasibility = true
+    model.is_qp = false
     empty!(model.binaries)
     empty!(model.variable_info)
     empty!(model.affine_constraint_info)
@@ -359,9 +364,10 @@ function MOI.get(::Optimizer, ::MOI.ListOfVariableAttributesSet)
 end
 
 function MOI.get(model::Optimizer, ::MOI.ListOfModelAttributesSet)
+    F = MOI.get(model, MOI.ObjectiveFunctionType())
     attributes = [
         MOI.ObjectiveSense(),
-        MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(),
+        MOI.ObjectiveFunction{F}(),
     ]
     if MOI.get(model, MOI.Name()) != ""
         push!(attributes, MOI.Name())
@@ -712,8 +718,19 @@ function MOI.supports(
     return true
 end
 
-function MOI.get(::Optimizer, ::MOI.ObjectiveFunctionType)
-    return MOI.ScalarAffineFunction{Float64}
+function MOI.supports(
+    ::Optimizer,
+    ::MOI.ObjectiveFunction{MOI.ScalarQuadraticFunction{Float64}},
+)
+    return true
+end
+
+function MOI.get(model::Optimizer, ::MOI.ObjectiveFunctionType)
+    if model.is_qp
+        return MOI.ScalarQuadraticFunction{Float64}
+    else
+        return MOI.ScalarAffineFunction{Float64}
+    end
 end
 
 function MOI.set(
@@ -732,26 +749,108 @@ function MOI.set(
     ret = Highs_changeColsCostByMask(model, mask, obj)
     _check_ret(ret)
     model.objective_constant = f.constant
+    model.is_qp = false
     return
 end
 
-function MOI.get(
+# TODO(odow): this is hopelessly slow.
+# Wait until the C API adds a method to set the Q matrix without rebuilding the
+# full problem.
+function MOI.set(
     model::Optimizer,
-    ::MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}},
+    ::MOI.ObjectiveFunction{MOI.ScalarQuadraticFunction{Float64}},
+    f::MOI.ScalarQuadraticFunction{Float64},
 )
-    ncols = MOI.get(model, MOI.NumberOfVariables())
-    if ncols == 0
+    orientation = 0
+    numcol = Highs_getNumCol(model)
+    numrow = Highs_getNumRow(model)
+    numnz = Highs_getNumNz(model)
+    sense = Ref{Cint}()
+    collower = Vector{Cdouble}(undef, numcol)
+    colupper = Vector{Cdouble}(undef, numcol)
+    rowupper = Vector{Cdouble}(undef, numrow)
+    rowlower = Vector{Cdouble}(undef, numrow)
+    astart = Vector{Cint}(undef, numcol)
+    aindex = Vector{Cint}(undef, numnz)
+    avalue = Vector{Cdouble}(undef, numnz)
+    integrality = Vector{Cint}(undef, numcol)
+    ret = Highs_getModel(
+        model,
+        orientation,
+        Ref{Cint}(), # numcol
+        Ref{Cint}(), # numrow,
+        Ref{Cint}(), # numnz,
+        Ref{Cint}(), # hessian_num_nz,
+        sense,
+        C_NULL, # offset,
+        C_NULL, # colcost,
+        collower,
+        colupper,
+        rowlower,
+        rowupper,
+        astart,
+        aindex,
+        avalue,
+        C_NULL, # qstart,
+        C_NULL, # qindex,
+        C_NULL, # qvalue,
+        integrality,
+    )
+    _check_ret(ret)
+    colcost = zeros(Cdouble, numcol)
+    for term in f.affine_terms
+        info = model.variable_info[term.variable]
+        colcost[info.column] = term.coefficient
+    end
+    I, J, V = Cint[], Cint[], Cdouble[]
+    for term in f.quadratic_terms
+        push!(I, model.variable_info[term.variable_1].column)
+        push!(J, model.variable_info[term.variable_2].column)
+        push!(V, term.coefficient)
+    end
+    Q = SparseArrays.sparse(I, J, V, numcol, numcol)
+    ret = Highs_passModel(
+        model,
+        numcol,
+        numrow,
+        numnz,
+        length(Q.nzval),
+        orientation, # rowwise,
+        sense[],
+        0.0, # offset,
+        colcost,
+        collower,
+        colupper,
+        rowlower,
+        rowupper,
+        astart,
+        aindex,
+        avalue,
+        Q.colptr .- Cint(1),
+        Q.rowval .- Cint(1),
+        Q.nzval,
+        integrality,
+    )
+    _check_ret(ret)
+    model.objective_constant = f.constant
+    model.is_qp = true
+    return
+end
+
+function _get_affine_objective_function(model::Optimizer)
+    numcol = MOI.get(model, MOI.NumberOfVariables())
+    if numcol == 0
         return MOI.ScalarAffineFunction{Float64}(
             MOI.ScalarAffineTerm{Float64}[],
             model.objective_constant,
         )
     end
     num_colsP, nnzP = Ref{Cint}(0), Ref{Cint}(0)
-    costs = Vector{Cdouble}(undef, ncols)
+    costs = Vector{Cdouble}(undef, numcol)
     ret = Highs_getColsByRange(
         model,
         0,
-        ncols - 1,
+        numcol - 1,
         num_colsP,
         costs,
         C_NULL,
@@ -771,11 +870,53 @@ function MOI.get(
     )
 end
 
-function MOI.get(model::Optimizer, ::MOI.ObjectiveFunction{F}) where {F}
-    obj = MOI.get(
+function _get_quadratic_objective_function(model::Optimizer)
+    numcol = Highs_getNumCol(model)
+    hessian_num_nz = Highs_getHessianNumNz(model)
+    sense = Ref{Cint}()
+    offset = Ref{Cdouble}()
+    colcost = Vector{Cdouble}(undef, numcol)
+    qstart = Vector{Cint}(undef, numcol)
+    qindex = Vector{Cint}(undef, hessian_num_nz)
+    qvalue = Vector{Cdouble}(undef, hessian_num_nz)
+    ret = Highs_getModel(
         model,
-        MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(),
+        0, # orientation, # Given column-wise
+        Ref{Cint}(), # numcol,
+        C_NULL, # numrow,
+        C_NULL, # numnz,
+        Ref{Cint}(), # hessian_num_nz,
+        sense,
+        offset,
+        colcost,
+        C_NULL, # collower,
+        C_NULL, # colupper,
+        C_NULL, # rowlower,
+        C_NULL, # rowupper,
+        C_NULL, # astart,
+        C_NULL, # aindex,
+        C_NULL, # avalue,
+        qstart,
+        qindex,
+        qvalue,
+        C_NULL, # integrality,
     )
+    _check_ret(ret)
+    scalar_terms = [
+        MOI.ScalarAffineTerm(colcost[info.column+1], index) for
+        (index, info) in model.variable_info if
+        !iszero(colcost[info.column+1])
+    ]
+    quadratic_terms = MOI.ScalarQuadraticTerm{Float64}[]
+    return MOI.ScalarQuadraticFunction(scalar_terms, quadratic_terms, offset[])
+end
+
+function MOI.get(model::Optimizer, ::MOI.ObjectiveFunction{F}) where {F}
+    obj = if model.is_qp
+        _get_quadratic_objective_function(model)
+    else
+        _get_affine_objective_function(model)
+    end
     return convert(F, obj)
 end
 
