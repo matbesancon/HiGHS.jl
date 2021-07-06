@@ -761,7 +761,7 @@ function MOI.set(
     ::MOI.ObjectiveFunction{MOI.ScalarQuadraticFunction{Float64}},
     f::MOI.ScalarQuadraticFunction{Float64},
 )
-    orientation = 0
+    orientation = 1
     numcol = Highs_getNumCol(model)
     numrow = Highs_getNumRow(model)
     numnz = Highs_getNumNz(model)
