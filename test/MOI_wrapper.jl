@@ -41,7 +41,7 @@ function test_unittest(model, config)
             # These are excluded because HiGHS does not support them.
             "delete_soc_variables",
             "solve_qcp_edge_cases",
-            "solve_qp_edge_cases",
+            # "solve_qp_edge_cases",
             "solve_integer_edge_cases",
             "solve_objbound_edge_cases",
             "solve_zero_one_with_bounds_1",
@@ -94,6 +94,11 @@ end
 function test_lintest(model, config)
     return MOI.Test.lintest(model, config)
 end
+
+function test_quadratic(model, config)
+    return MOI.Test.qptest(model, config)
+end
+
 
 function test_int_lineartest(model, config)
     MOI.Test.intlineartest(
