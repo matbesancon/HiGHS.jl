@@ -770,10 +770,11 @@ function MOI.set(
     colupper = Vector{Cdouble}(undef, numcol)
     rowupper = Vector{Cdouble}(undef, numrow)
     rowlower = Vector{Cdouble}(undef, numrow)
-    astart = Vector{Cint}(undef, numcol)
+    astart = Vector{Cint}(undef, numcol + 1)
     aindex = Vector{Cint}(undef, numnz)
     avalue = Vector{Cdouble}(undef, numnz)
     integrality = Vector{Cint}(undef, numcol)
+    colcost = Vector{Cdouble}(undef, numcol)
     ret = Highs_getModel(
         model,
         orientation,
@@ -782,8 +783,8 @@ function MOI.set(
         Ref{Cint}(), # numnz,
         Ref{Cint}(), # hessian_num_nz,
         sense,
-        C_NULL, # offset,
-        C_NULL, # colcost,
+        Ref{Cdouble}(),
+        colcost,
         collower,
         colupper,
         rowlower,
@@ -797,18 +798,23 @@ function MOI.set(
         integrality,
     )
     _check_ret(ret)
-    colcost = zeros(Cdouble, numcol)
+    fill!(colcost, 0.0)
     for term in f.affine_terms
-        info = model.variable_info[term.variable]
-        colcost[info.column] = term.coefficient
+        info = model.variable_info[term.variable_index]
+        colcost[info.column+1] = term.coefficient
     end
     I, J, V = Cint[], Cint[], Cdouble[]
     for term in f.quadratic_terms
-        push!(I, model.variable_info[term.variable_1].column)
-        push!(J, model.variable_info[term.variable_2].column)
-        push!(V, term.coefficient)
+        push!(I, model.variable_info[term.variable_index_1].column + 1)
+        push!(J, model.variable_info[term.variable_index_2].column + 1)
+        if I[end] == J[end]
+            push!(V, 2 * term.coefficient)
+        else
+            push!(V, term.coefficient)
+        end
     end
     Q = SparseArrays.sparse(I, J, V, numcol, numcol)
+    Highs_clearModel(model)
     ret = Highs_passModel(
         model,
         numcol,
@@ -2351,14 +2357,14 @@ function MOI.copy_to(
     end
     numrow = Cint(length(rowlower))
     A = SparseArrays.sparse(I, J, V, numrow, numcol)
+    is_max = MOI.get(src, MOI.ObjectiveSense()) == MOI.MAX_SENSE
     Highs_passLp(
         dest,
         numcol,
         numrow,
         length(V),
         0,  # The A matrix is given is column-wise.
-        MOI.get(src, MOI.ObjectiveSense()) == MOI.MAX_SENSE ? Cint(-1) :
-        Cint(1),
+        is_max ? Cint(-1) : Cint(1),
         0.0,
         colcost,
         collower,
